@@ -2,7 +2,11 @@ node_modules/
 build/
 dist/
 coverage/
-data/
+# Âncora em "/" de propósito: sem ela, "data/" também casaria com src/data/ (que
+# é código-fonte de verdade, não estado de runtime) — foi exatamente esse bug
+# que quebrou o build da Vercel por excluir src/data/mockSecurityData.ts do git
+# desde o primeiro commit deste repositório.
+/data/
 .DS_Store
 *.log
 .env*
