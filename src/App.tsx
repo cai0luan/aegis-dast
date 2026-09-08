@@ -131,7 +131,15 @@ export default function App() {
       }
       const { scan } = await res.json();
       setActiveScan(scan);
-      pollScan(scan.id);
+      if (RUNNING_STATUSES.includes(scan.status)) {
+        // Hoje /api/scans é síncrona e sempre devolve um status terminal (ver
+        // server/scanOrchestrator.ts) — este ramo é só uma rede de segurança
+        // caso isso mude no futuro para um modelo assíncrono de verdade.
+        pollScan(scan.id);
+      } else {
+        setIsScanning(false);
+        fetchTargets(scan.targetId);
+      }
     } catch (err) {
       console.error('[App] Falha ao iniciar varredura:', err);
       alert('Falha de comunicação com o servidor ao iniciar a varredura.');
@@ -191,6 +199,7 @@ export default function App() {
               <PipelineOrchestratorView
                 target={selectedTarget}
                 activeScan={activeScan}
+                isScanning={isScanning}
                 onStartScan={handleStartScan}
                 onStopScan={handleStopScan}
                 onViewReport={() => setActiveTab('reports')}

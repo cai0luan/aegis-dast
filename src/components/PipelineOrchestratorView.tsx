@@ -23,6 +23,7 @@ import { SAMPLE_COMPLETED_SCAN, INITIAL_VULNERABILITIES } from '../data/mockSecu
 interface PipelineOrchestratorViewProps {
   target: TargetDomain | null;
   activeScan: ScanJob | null;
+  isScanning: boolean;
   onStartScan: (target: TargetDomain, profile: ScanProfile, config: any) => void;
   onStopScan: () => void;
   onViewReport: (scan: ScanJob) => void;
@@ -33,6 +34,7 @@ interface PipelineOrchestratorViewProps {
 export const PipelineOrchestratorView: React.FC<PipelineOrchestratorViewProps> = ({
   target,
   activeScan,
+  isScanning,
   onStartScan,
   onStopScan,
   onViewReport,
@@ -53,7 +55,7 @@ export const PipelineOrchestratorView: React.FC<PipelineOrchestratorViewProps> =
 
   const displayScan = activeScan || SAMPLE_COMPLETED_SCAN;
   const isVerified = target?.verificationStatus === 'VERIFIED';
-  const isRunning = activeScan?.status === 'RECON' || activeScan?.status === 'ACTIVE_SCAN' || activeScan?.status === 'TRIAGE' || activeScan?.status === 'QUEUED';
+  const isRunning = isScanning || activeScan?.status === 'RECON' || activeScan?.status === 'ACTIVE_SCAN' || activeScan?.status === 'TRIAGE' || activeScan?.status === 'QUEUED';
 
   const DATA_SOURCE_BADGES: Record<string, { label: string; className: string }> = {
     REAL: { label: 'DADOS REAIS', className: 'bg-emerald-950 text-emerald-400 border-emerald-800' },
@@ -191,6 +193,23 @@ export const PipelineOrchestratorView: React.FC<PipelineOrchestratorViewProps> =
         </div>
       </div>
 
+      {isScanning ? (
+        // Enquanto a requisição síncrona de /api/scans está em voo, `activeScan`
+        // ainda é o valor ANTERIOR (nulo ou de um scan já concluído) — renderizar
+        // os cards/terminal aqui embaixo mostraria um relatório antigo com cara de
+        // atual. Este painel existe só para nunca mentir sobre o que está
+        // acontecendo enquanto a resposta de verdade não chega.
+        <div className="bg-[#161618] border border-[#262626] rounded-2xl p-10 flex flex-col items-center justify-center text-center space-y-4 shadow-sm">
+          <Activity className="w-10 h-10 text-cyan-400 animate-spin" />
+          <div>
+            <h3 className="text-base font-bold text-white">Executando varredura ao vivo...</h3>
+            <p className="text-xs text-[#A1A1AA] mt-1 max-w-md">
+              Reconhecimento passivo real (DNS, crt.sh, HTTP, TLS) contra {target?.domain}, seguido de amostra simulada e triagem por IA. Isto roda numa única requisição — pode levar alguns segundos.
+            </p>
+          </div>
+        </div>
+      ) : (
+      <>
       {/* 3-Stage Pipeline Visualizer */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         {stages.map((stg) => {
@@ -419,6 +438,8 @@ export const PipelineOrchestratorView: React.FC<PipelineOrchestratorViewProps> =
           </div>
         </div>
       </div>
+      </>
+      )}
     </div>
   );
 };

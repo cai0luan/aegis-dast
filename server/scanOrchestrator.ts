@@ -16,7 +16,6 @@ import { INITIAL_VULNERABILITIES } from '../src/data/mockSecurityData';
 
 function nowIso() { return new Date().toISOString(); }
 function nowClock() { return new Date().toLocaleTimeString('pt-BR'); }
-function delay(ms: number) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
 type LogLevel = 'INFO' | 'WARN' | 'ERROR' | 'SUCCESS' | 'DEBUG';
 
@@ -172,7 +171,6 @@ async function runScan(jobId: string): Promise<void> {
   updateScan(jobId, { status: 'ACTIVE_SCAN', currentStageIndex: 1 });
   patchStage(jobId, 1, { status: 'RUNNING', progress: 30, summary: 'Gerando amostra ilustrativa de saída (Nuclei/OWASP ZAP reais não disponíveis nesta sandbox)...' });
   appendLog(jobId, 'WARN', 'DAST', '[SIMULAÇÃO] Esta etapa não executa Nuclei/OWASP ZAP reais neste ambiente. Os achados abaixo são uma amostra ilustrativa do formato de saída esperado, não uma exploração real.');
-  await delay(1800);
 
   const simulatedVulns = cloneSimulatedTemplates(targetDomain);
   const afterStage2 = getScan(jobId)!;
@@ -192,23 +190,31 @@ async function runScan(jobId: string): Promise<void> {
     ? '[Gemini] Iniciando triagem real de cada achado (falso positivo vs. confirmado)...'
     : '[Fallback] Nenhuma chave de IA configurada; mantendo classificação heurística do motor de correlação.');
 
+  // Em paralelo, não em série: a rota inteira agora roda dentro de uma única
+  // requisição HTTP (ver startScan), então a soma sequencial de N chamadas ao
+  // Gemini é exatamente o tipo de latência que arrisca estourar o timeout da
+  // função na Vercel. Em paralelo, o custo é o da chamada mais lenta, não a soma.
   const currentJob = getScan(jobId)!;
-  let anyRealModelUsed = false;
-  const triagedVulns: Vulnerability[] = [];
-  for (const vuln of currentJob.vulnerabilities) {
-    try {
-      const result = await triageVulnerability(vuln, targetDomain, `REQUEST:\n${vuln.proofOfConcept.httpRequest}\n\nRESPONSE:\n${vuln.proofOfConcept.httpResponse}`);
-      if (result.usedRealModel) anyRealModelUsed = true;
-      triagedVulns.push({
-        ...vuln,
-        status: result.isFalsePositive ? 'FALSE_POSITIVE' : vuln.status,
-        aiConfidenceScore: result.confidenceScore,
-        aiTriageReasoning: result.reasoning
-      });
-    } catch {
-      triagedVulns.push(vuln);
-    }
-  }
+  const triageOutcomes = await Promise.all(
+    currentJob.vulnerabilities.map(async (vuln): Promise<{ vuln: Vulnerability; usedRealModel: boolean }> => {
+      try {
+        const result = await triageVulnerability(vuln, targetDomain, `REQUEST:\n${vuln.proofOfConcept.httpRequest}\n\nRESPONSE:\n${vuln.proofOfConcept.httpResponse}`);
+        return {
+          usedRealModel: result.usedRealModel,
+          vuln: {
+            ...vuln,
+            status: result.isFalsePositive ? 'FALSE_POSITIVE' : vuln.status,
+            aiConfidenceScore: result.confidenceScore,
+            aiTriageReasoning: result.reasoning
+          }
+        };
+      } catch {
+        return { vuln, usedRealModel: false };
+      }
+    })
+  );
+  const triagedVulns = triageOutcomes.map(o => o.vuln);
+  const anyRealModelUsed = triageOutcomes.some(o => o.usedRealModel);
 
   const falsePositives = triagedVulns.filter(v => v.status === 'FALSE_POSITIVE').length;
   const hasSimulated = triagedVulns.some(v => v.dataSource === 'SIMULATED_DAST');
@@ -248,16 +254,24 @@ function finalizeCancelled(jobId: string) {
   updateScan(jobId, { status: 'FAILED', completedAt: nowIso() });
 }
 
-export function startScan(target: TargetDomain, profile: ScanProfile, config: ScanConfiguration): ScanJob {
+// Síncrono de propósito: a rota HTTP faz `await startScan(...)` e só responde
+// quando o pipeline inteiro termina. Ver o comentário grande em routes.ts sobre
+// por que um modelo de job em segundo plano + polling não é seguro numa função
+// serverless da Vercel (a invocação é congelada assim que a resposta sai, e o
+// próximo poll pode cair numa instância sem nenhuma memória do job). Rodar do
+// mesmo jeito em dev local e na Vercel é deliberado — um caminho só, testado nos
+// dois ambientes, é melhor que dois caminhos onde um deles só é exercitado em
+// produção.
+export async function startScan(target: TargetDomain, profile: ScanProfile, config: ScanConfiguration): Promise<ScanJob> {
   const job = createScan(buildInitialJob(target, profile, config));
-  // Roda em segundo plano — a rota HTTP responde imediatamente com status QUEUED
-  // e o frontend faz polling em GET /api/scans/:id para acompanhar o progresso real.
-  void runScan(job.id).catch(err => {
+  try {
+    await runScan(job.id);
+  } catch (err: any) {
     console.error(`[scanOrchestrator] Falha não tratada no job ${job.id}:`, err);
     updateScan(job.id, { status: 'FAILED', completedAt: nowIso() });
     appendLog(job.id, 'ERROR', 'Orchestrator', `Falha inesperada: ${err?.message || err}`);
-  });
-  return job;
+  }
+  return getScan(job.id)!;
 }
 
 export function cancelScan(jobId: string): boolean {
