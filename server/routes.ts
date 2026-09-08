@@ -3,14 +3,32 @@
 // sobre a mesma instância Express — nenhum dos dois registra rota própria. Isso evita
 // a classe de bug onde um endpoint existe em dev e some em produção (ou o inverso),
 // porque as duas entradas literalmente compartilham este arquivo.
-import express, { Request, Response } from 'express';
+import express, { NextFunction, Request, Response } from 'express';
 import crypto from 'crypto';
 import * as db from './db';
+import * as targets from './targets';
 import { verifyDomainOwnership, sandboxVerify, isSandboxDemoAllowed, generateVerificationToken } from './domainVerification';
 import { startScan, cancelScan, buildInitialJob } from './scanOrchestrator';
 import { triageVulnerability, isAiConfigured } from './aiTriage';
 import { isRedisConfigured, enqueueScanJob, getScanFromRedis } from './queue';
 import type { TargetDomain, VerificationMethod, ScanProfile, ScanConfiguration } from '../src/types';
+
+// Express 4 não encaminha sozinho a rejeição de uma Promise para o middleware
+// de erro (isso só chegou nativamente no Express 5) — sem isto, um handler
+// async que lança some em silêncio: a requisição nunca responde. `wrap` fecha
+// essa lacuna sem trazer uma dependência nova (`express-async-errors` faria a
+// mesma coisa, mas isto é três linhas). Combinado com o handler de erro no
+// fim deste arquivo, é o que garante que NENHUMA rota consiga devolver algo
+// que não seja JSON válido — nem para um erro que ninguém previu.
+type Handler = (req: Request, res: Response, next: NextFunction) => unknown;
+function wrap(fn: Handler): Handler {
+  return (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+}
+
+function sanitizeDomain(input: unknown): string {
+  if (typeof input !== 'string') return '';
+  return input.replace(/^https?:\/\//i, '').replace(/\/.*$/, '').trim().toLowerCase();
+}
 
 export function registerRoutes(app: express.Express) {
   app.use(express.json());
@@ -22,27 +40,32 @@ export function registerRoutes(app: express.Express) {
       time: new Date().toISOString(),
       engine: 'AegisDAST-Core-v3',
       aiConfigured: isAiConfigured(),
-      sandboxDemoAllowed: isSandboxDemoAllowed()
+      sandboxDemoAllowed: isSandboxDemoAllowed(),
+      redisConfigured: isRedisConfigured()
     });
   });
 
-  // 2. Targets CRUD
-  app.get('/api/targets', (req: Request, res: Response) => {
-    res.json({ targets: db.listTargets() });
-  });
+  // 2. Targets CRUD — server/targets.ts decide sozinho entre Redis (Upstash) e
+  // o arquivo local/tmp (server/db.ts); nada aqui sabe ou precisa saber qual
+  // dos dois está ativo. Ver o comentário no topo de server/targets.ts.
+  app.get('/api/targets', wrap(async (req: Request, res: Response) => {
+    res.json({ targets: await targets.listTargets() });
+  }));
 
-  app.get('/api/targets/:id', (req: Request, res: Response) => {
-    const target = db.getTarget(req.params.id);
+  app.get('/api/targets/:id', wrap(async (req: Request, res: Response) => {
+    const target = await targets.getTarget(req.params.id);
     if (!target) return res.status(404).json({ error: 'Alvo não encontrado.' });
     res.json({ target });
-  });
+  }));
 
-  app.post('/api/targets', (req: Request, res: Response) => {
+  app.post('/api/targets', wrap(async (req: Request, res: Response) => {
     const { domain, organizationName, verificationMethod } = req.body || {};
     if (!domain || typeof domain !== 'string') {
       return res.status(400).json({ error: 'O campo "domain" é obrigatório.' });
     }
-    const cleanDomain = domain.replace(/^https?:\/\//i, '').replace(/\/.*$/, '').trim().toLowerCase();
+    // Aceita tanto "example.com" quanto "https://example.com/algum/caminho" —
+    // protocolo, caminho e barra final são descartados; só o host sobrevive.
+    const cleanDomain = sanitizeDomain(domain);
     if (!cleanDomain) {
       return res.status(400).json({ error: 'Domínio inválido.' });
     }
@@ -60,36 +83,32 @@ export function registerRoutes(app: express.Express) {
       totalVulns: { critical: 0, high: 0, medium: 0, low: 0, info: 0 }
     };
 
-    db.createTarget(target);
-    res.status(201).json({ target });
-  });
+    const created = await targets.createTarget(target);
+    res.status(201).json({ target: created });
+  }));
 
   // 3. Domain Ownership Verification (Anti-Abuse) — sem atalhos ocultos.
-  app.post('/api/verify-domain', async (req: Request, res: Response) => {
+  app.post('/api/verify-domain', wrap(async (req: Request, res: Response) => {
     const { targetId, domain, method, token } = req.body || {};
 
     if (!domain || !token || !method) {
       return res.status(400).json({ error: 'domain, method e token são obrigatórios.' });
     }
 
-    try {
-      const result = await verifyDomainOwnership(domain, method as VerificationMethod, token);
-      if (result.verified && targetId) {
-        db.updateTarget(targetId, {
-          verificationStatus: 'VERIFIED',
-          verificationMethod: result.method,
-          verifiedAt: new Date().toISOString()
-        });
-      }
-      return res.json(result);
-    } catch (err: any) {
-      return res.status(500).json({ error: err?.message || 'Verification error' });
+    const result = await verifyDomainOwnership(domain, method as VerificationMethod, token);
+    if (result.verified && targetId) {
+      await targets.updateTarget(targetId, {
+        verificationStatus: 'VERIFIED',
+        verificationMethod: result.method,
+        verifiedAt: new Date().toISOString()
+      });
     }
-  });
+    res.json(result);
+  }));
 
   // 3b. Verificação de sandbox/demo — explicitamente NÃO criptográfica, gravada com
   // método 'SANDBOX_DEMO', e só ativa quando ALLOW_DEMO_VERIFICATION=true.
-  app.post('/api/verify-domain/sandbox', (req: Request, res: Response) => {
+  app.post('/api/verify-domain/sandbox', wrap(async (req: Request, res: Response) => {
     if (!isSandboxDemoAllowed()) {
       return res.status(403).json({
         error: 'Verificação de sandbox desabilitada. Defina ALLOW_DEMO_VERIFICATION=true no .env para habilitar este atalho apenas em ambiente de demonstração.'
@@ -100,14 +119,14 @@ export function registerRoutes(app: express.Express) {
 
     const result = sandboxVerify(domain);
     if (targetId) {
-      db.updateTarget(targetId, {
+      await targets.updateTarget(targetId, {
         verificationStatus: 'VERIFIED',
         verificationMethod: 'SANDBOX_DEMO',
         verifiedAt: new Date().toISOString()
       });
     }
     res.json(result);
-  });
+  }));
 
   // 4. Scans — dois caminhos, escolhidos por isRedisConfigured() (ver server/queue.ts):
   //
@@ -125,61 +144,53 @@ export function registerRoutes(app: express.Express) {
   //   e devolve o resultado já completo. É o estado suportado para dev local sem
   //   depender do Upstash nem do worker Python estarem de pé (mesma filosofia de
   //   "rodar sem X é um estado suportado" usada em toda a camada de persistência).
-  app.post('/api/scans', async (req: Request, res: Response) => {
+  app.post('/api/scans', wrap(async (req: Request, res: Response) => {
     const { targetId, profile, config } = req.body || {};
-    const target = db.getTarget(targetId);
+    const target = await targets.getTarget(targetId);
     if (!target) return res.status(404).json({ error: 'Alvo não encontrado.' });
     if (target.verificationStatus !== 'VERIFIED') {
       return res.status(403).json({ error: 'Posse do domínio precisa estar validada antes de iniciar uma varredura.' });
     }
 
-    try {
-      if (isRedisConfigured()) {
-        const job = buildInitialJob(target, (profile as ScanProfile) || 'NORMAL', config as ScanConfiguration);
-        await enqueueScanJob(job);
-        return res.status(202).json({ scan: job });
-      }
-      const job = await startScan(target, (profile as ScanProfile) || 'NORMAL', config as ScanConfiguration);
-      res.status(200).json({ scan: job });
-    } catch (err: any) {
-      res.status(500).json({ error: err?.message || 'Falha ao executar a varredura.' });
+    if (isRedisConfigured()) {
+      const job = buildInitialJob(target, (profile as ScanProfile) || 'NORMAL', config as ScanConfiguration);
+      await enqueueScanJob(job);
+      return res.status(202).json({ scan: job });
     }
-  });
+    const job = await startScan(target, (profile as ScanProfile) || 'NORMAL', config as ScanConfiguration);
+    res.status(200).json({ scan: job });
+  }));
 
-  app.get('/api/scans/:id', async (req: Request, res: Response) => {
-    try {
-      const job = isRedisConfigured() ? await getScanFromRedis(req.params.id) : db.getScan(req.params.id);
-      if (!job) return res.status(404).json({ error: 'Scan não encontrado.' });
+  app.get('/api/scans/:id', wrap(async (req: Request, res: Response) => {
+    const job = isRedisConfigured() ? await getScanFromRedis(req.params.id) : db.getScan(req.params.id);
+    if (!job) return res.status(404).json({ error: 'Scan não encontrado.' });
 
-      // O worker Python não tem como enxergar o alvo local (db.ts vive só no
-      // lado Node/Vercel) — então é aqui, ao ler um scan concluído vindo do
-      // Redis, que sincronizamos o score/contagens do alvo. Idempotente: repetir
-      // a mesma escrita em polls seguintes ao já concluído é inofensivo.
-      if (isRedisConfigured() && job.status === 'COMPLETED' && job.executiveSummary) {
-        const confirmed = job.vulnerabilities.filter(v => v.status === 'CONFIRMED');
-        db.updateTarget(job.targetId, {
-          lastScanAt: job.completedAt || new Date().toISOString(),
-          riskScore: job.executiveSummary.riskScore,
-          totalVulns: {
-            critical: confirmed.filter(v => v.severity === 'CRITICAL').length,
-            high: confirmed.filter(v => v.severity === 'HIGH').length,
-            medium: confirmed.filter(v => v.severity === 'MEDIUM').length,
-            low: confirmed.filter(v => v.severity === 'LOW').length,
-            info: confirmed.filter(v => v.severity === 'INFO').length
-          }
-        });
-      }
-
-      res.json({ scan: job });
-    } catch (err: any) {
-      res.status(500).json({ error: err?.message || 'Falha ao consultar o scan.' });
+    // O worker Python não tem como enxergar o alvo local (targets.ts vive só no
+    // lado Node/Vercel) — então é aqui, ao ler um scan concluído vindo do
+    // Redis, que sincronizamos o score/contagens do alvo. Idempotente: repetir
+    // a mesma escrita em polls seguintes ao já concluído é inofensivo.
+    if (isRedisConfigured() && job.status === 'COMPLETED' && job.executiveSummary) {
+      const confirmed = job.vulnerabilities.filter(v => v.status === 'CONFIRMED');
+      await targets.updateTarget(job.targetId, {
+        lastScanAt: job.completedAt || new Date().toISOString(),
+        riskScore: job.executiveSummary.riskScore,
+        totalVulns: {
+          critical: confirmed.filter(v => v.severity === 'CRITICAL').length,
+          high: confirmed.filter(v => v.severity === 'HIGH').length,
+          medium: confirmed.filter(v => v.severity === 'MEDIUM').length,
+          low: confirmed.filter(v => v.severity === 'LOW').length,
+          info: confirmed.filter(v => v.severity === 'INFO').length
+        }
+      });
     }
-  });
 
-  app.get('/api/scans', (req: Request, res: Response) => {
+    res.json({ scan: job });
+  }));
+
+  app.get('/api/scans', wrap(async (req: Request, res: Response) => {
     const targetId = typeof req.query.targetId === 'string' ? req.query.targetId : undefined;
     res.json({ scans: db.listScans(targetId) });
-  });
+  }));
 
   // Mantido por compatibilidade e para o caso local (processo único, várias
   // requisições concorrentes no mesmo event loop): ainda pode interromper um job
@@ -187,22 +198,18 @@ export function registerRoutes(app: express.Express) {
   // Vercel isto não tem efeito prático, já que o pipeline roda por inteiro dentro
   // da mesma requisição que o disparou — não há uma segunda invocação concorrente
   // para interromper a primeira.
-  app.post('/api/scans/:id/stop', (req: Request, res: Response) => {
+  app.post('/api/scans/:id/stop', wrap(async (req: Request, res: Response) => {
     const ok = cancelScan(req.params.id);
     if (!ok) return res.status(404).json({ error: 'Scan não encontrado.' });
     res.json({ stopped: true });
-  });
+  }));
 
   // 5. AI Triage manual (re-executar a triagem de um achado específico pela UI)
-  app.post('/api/ai/triage', async (req: Request, res: Response) => {
+  app.post('/api/ai/triage', wrap(async (req: Request, res: Response) => {
     const { vulnerability, targetDomain, rawHttpTrace } = req.body || {};
-    try {
-      const result = await triageVulnerability(vulnerability || {}, targetDomain || 'alvo-desconhecido', rawHttpTrace);
-      res.json(result);
-    } catch (err: any) {
-      res.status(500).json({ error: err?.message || 'Triage error' });
-    }
-  });
+    const result = await triageVulnerability(vulnerability || {}, targetDomain || 'alvo-desconhecido', rawHttpTrace);
+    res.json(result);
+  }));
 
   // 6. WAF & Bypass Configuration Generator
   app.get('/api/waf/config', (req: Request, res: Response) => {
@@ -253,5 +260,16 @@ limit_req_whitelist $aegis_scan_allow;
 `
       }
     });
+  });
+
+  // Rede de segurança final: qualquer erro que escape dos try/catch acima (ou
+  // de um throw síncrono) cai aqui — nunca na página de erro genérica da
+  // plataforma, que devolve HTML/texto e é exatamente o que quebrava
+  // response.json() no frontend com "Unexpected token... is not valid JSON".
+  // Precisa dos 4 parâmetros — é assim que o Express reconhece um error handler.
+  app.use((err: any, req: Request, res: Response, next: NextFunction) => {
+    console.error('[routes] Erro não tratado:', err);
+    if (res.headersSent) return next(err);
+    res.status(500).json({ error: err?.message || 'Erro interno do servidor.' });
   });
 }

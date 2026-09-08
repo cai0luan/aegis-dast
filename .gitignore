@@ -13,4 +13,8 @@ coverage/
 !.env.example
 worker/.venv/
 worker/__pycache__/
+# Binário de terceiros que cada operador instala localmente (ver worker/README.md)
+# — nunca pertence a este repositório, licença própria e específico de plataforma.
+worker/nuclei
+worker/nuclei.exe
 

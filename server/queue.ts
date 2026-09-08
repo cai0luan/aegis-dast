@@ -16,26 +16,13 @@
 // routes.ts cai para o pipeline síncrono em processo (ver scanOrchestrator.ts) —
 // rodar sem fila real é um estado suportado, não um erro, para dev local sem
 // depender de credenciais do Upstash nem do worker Python estar de pé.
-import { Redis } from '@upstash/redis';
+import { getRedisClient, isRedisConfigured } from './redisClient';
 import type { ScanJob } from '../src/types';
+
+export { isRedisConfigured };
 
 const QUEUE_KEY = 'aegis_jobs';
 const SCAN_HASH_TTL_SECONDS = 60 * 60 * 24 * 7; // 7 dias — evita crescer o Upstash sem limite
-
-export function isRedisConfigured(): boolean {
-  return !!(process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN);
-}
-
-let client: Redis | null = null;
-function getClient(): Redis {
-  if (!client) {
-    client = new Redis({
-      url: process.env.UPSTASH_REDIS_REST_URL!,
-      token: process.env.UPSTASH_REDIS_REST_TOKEN!
-    });
-  }
-  return client;
-}
 
 function scanKey(jobId: string): string {
   return `scan:${jobId}`;
@@ -45,7 +32,7 @@ function scanKey(jobId: string): string {
 // imediatamente após o POST (antes de qualquer worker pegar o job) encontre o
 // registro com status QUEUED em vez de 404.
 export async function enqueueScanJob(job: ScanJob): Promise<void> {
-  const redis = getClient();
+  const redis = getRedisClient();
   const payload = JSON.stringify(job);
   await Promise.all([
     redis.lpush(QUEUE_KEY, payload),
@@ -55,7 +42,7 @@ export async function enqueueScanJob(job: ScanJob): Promise<void> {
 }
 
 export async function getScanFromRedis(jobId: string): Promise<ScanJob | null> {
-  const redis = getClient();
+  const redis = getRedisClient();
   const fields = await redis.hgetall<{ status?: string; job?: string }>(scanKey(jobId));
   if (!fields || !fields.job) return null;
   // O cliente do Upstash já desserializa valores que parecem JSON automaticamente

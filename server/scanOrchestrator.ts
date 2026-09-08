@@ -9,7 +9,8 @@
 // heurístico transparente quando não estiver. Nenhuma etapa promove um dado
 // simulado a "real" — ver Vulnerability.dataSource e ScanStage.dataSource.
 import type { ScanJob, ScanConfiguration, ScanProfile, TargetDomain, Vulnerability, ScanStage } from '../src/types';
-import { createScan, updateScan, getScan, updateTarget } from './db';
+import { createScan, updateScan, getScan } from './db';
+import { updateTarget } from './targets';
 import { runPassiveRecon, deriveVulnerabilitiesFromRecon } from './reconEngine';
 import { triageVulnerability, isAiConfigured } from './aiTriage';
 import { INITIAL_VULNERABILITIES } from '../src/data/mockSecurityData';
@@ -236,7 +237,7 @@ async function runScan(jobId: string): Promise<void> {
   appendLog(jobId, 'SUCCESS', 'AI Triage', `Triagem concluída (${anyRealModelUsed ? 'modelo real' : 'fallback heurístico'}). ${falsePositives} descartado(s), ${triagedVulns.length - falsePositives} confirmado(s).`);
   appendLog(jobId, 'SUCCESS', 'Reporter', `Relatório Executivo e Técnico gerado. Score de Risco: ${executiveSummary.riskScore}/100 (${executiveSummary.overallRisk}).`);
 
-  updateTarget(currentJob.targetId, {
+  await updateTarget(currentJob.targetId, {
     lastScanAt: nowIso(),
     riskScore: executiveSummary.riskScore,
     totalVulns: {
