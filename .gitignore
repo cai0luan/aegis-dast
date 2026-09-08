@@ -17,4 +17,6 @@ worker/__pycache__/
 # — nunca pertence a este repositório, licença própria e específico de plataforma.
 worker/nuclei
 worker/nuclei.exe
+worker/katana
+worker/katana.exe
 

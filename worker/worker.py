@@ -7,24 +7,35 @@ máquina onde você possa instalar o Nuclei de verdade). A Vercel só enfileira
   1) Faz RPOP da fila `aegis_jobs` em loop contínuo.
   2) Marca o job como "em execução" no hash `scan:<id>` do Upstash.
   3) Executa reconhecimento passivo real (DNS, TLS, cabeçalhos HTTP).
-  4) Executa o Nuclei de verdade via subprocess (nunca shell=True, domínio
-     sempre passado como argumento discreto — nunca interpolado numa string de
-     shell) contra o alvo, que já passou pela validação de posse de domínio
-     no lado Node antes de qualquer job chegar aqui.
-  5) Envia os achados brutos ao Gemini 2.5 Flash para triagem e formatação.
+  4) Etapa 2, motor multi-engine, cada um opcional e independente dos outros:
+       a) Katana faz o crawl/spider do alvo para descobrir endpoints reais
+          (filtrados para o próprio domínio — um crawl nunca deve espalhar o
+          escopo do scan para fora do que foi verificado).
+       b) Nuclei roda contra os endpoints descobertos (ou só a raiz, se o
+          Katana não achou nada ou não está instalado) via subprocess (nunca
+          shell=True, domínio/URLs sempre como argumento discreto — nunca
+          interpolados numa string de shell).
+       c) OWASP ZAP, se um daemon local estiver acessível, faz spider +
+          active scan próprios e contribui seus alertas.
+     Os achados de Nuclei e ZAP são combinados e deduplicados.
+  5) Envia os achados brutos ao Gemini (gemini-3.6-flash) para triagem e formatação.
   6) Grava o relatório final de volta no hash e marca "COMPLETED".
 
 Honestidade de dados, mesmo padrão do resto do projeto: cada Vulnerability
 carrega um dataSource ('REAL_PASSIVE_RECON' para o que este script observa
-direto, 'REAL_ACTIVE_DAST' para achado real do Nuclei) — nunca um valor
-fabricado apresentado como medição.
+direto, 'REAL_ACTIVE_DAST' para achado real do Nuclei ou do ZAP) — nunca um
+valor fabricado apresentado como medição.
 
 Pré-requisitos que este script NÃO instala sozinho, por design (não é papel de
 um worker de scanner baixar/instalar ferramentas de terceiros sozinho):
   - Nuclei precisa estar instalado e no PATH (ou apontado por NUCLEI_PATH no
-    .env). Sem ele, a Etapa 2 roda vazia (zero achados), logada honestamente
-    como "Nuclei não encontrado" — nunca some silenciosamente nem finge ter
-    rodado.
+    .env). Sem ele, a etapa de Nuclei roda vazia, logada honestamente como
+    "Nuclei não encontrado" — nunca some silenciosamente nem finge ter rodado.
+  - Katana é OPCIONAL (KATANA_PATH ou PATH do sistema). Sem ele, o Nuclei cai
+    para escanear só a URL raiz do alvo — mesma disciplina de honestidade.
+  - OWASP ZAP é OPCIONAL: precisa de um daemon já rodando localmente
+    (ZAP_PROXY_URL, padrão http://127.0.0.1:8080, e ZAP_API_KEY). Sem ele,
+    a etapa de ZAP é pulada com um aviso claro, nunca uma falha do job.
   - Python 3.9+ e as dependências de requirements.txt.
 """
 from __future__ import annotations
@@ -38,10 +49,12 @@ import socket
 import ssl
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 import dns.resolver
 import dns.exception
@@ -56,10 +69,18 @@ POLL_INTERVAL_SECONDS = 3
 HTTP_TIMEOUT_SECONDS = 8
 TLS_TIMEOUT_SECONDS = 8
 NUCLEI_TIMEOUT_SECONDS = 180
+KATANA_TIMEOUT_SECONDS = 400  # folga sobre o -ct 5 pedido ao katana (5min, se a flag for em minutos)
+ZAP_POLL_INTERVAL_SECONDS = 2
+ZAP_SPIDER_TIMEOUT_SECONDS = 60
+ZAP_ASCAN_TIMEOUT_SECONDS = 120
+MAX_KATANA_ENDPOINTS = 200  # teto de sanidade: não deixa um crawl grande virar milhares de alvos pro nuclei
 SCAN_HASH_TTL_SECONDS = 60 * 60 * 24 * 7  # 7 dias, mesmo valor usado em server/queue.ts
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 NUCLEI_PATH_OVERRIDE = os.environ.get("NUCLEI_PATH", "").strip()
+KATANA_PATH_OVERRIDE = os.environ.get("KATANA_PATH", "").strip()
+ZAP_PROXY_URL = os.environ.get("ZAP_PROXY_URL", "http://127.0.0.1:8080").strip()
+ZAP_API_KEY = os.environ.get("ZAP_API_KEY", "").strip()
 
 SECURITY_HEADERS_CHECKLIST = [
     "content-security-policy",
@@ -392,6 +413,12 @@ def find_nuclei_binary() -> Optional[str]:
     return shutil.which("nuclei")
 
 
+def find_katana_binary() -> Optional[str]:
+    if KATANA_PATH_OVERRIDE:
+        return KATANA_PATH_OVERRIDE if os.path.isfile(KATANA_PATH_OVERRIDE) else None
+    return shutil.which("katana")
+
+
 def is_safe_hostname(domain: str) -> bool:
     return bool(HOSTNAME_RE.match(domain)) or _is_ip(domain)
 
@@ -404,16 +431,68 @@ def _is_ip(value: str) -> bool:
         return False
 
 
+def is_in_scope(url: str, domain: str) -> bool:
+    """O domínio já passou pela validação de posse (Node) antes deste job
+    existir — mas um crawler pode descobrir links para OUTROS domínios
+    (CDNs, terceiros, redirecionamentos). Deixar esses vazarem para o Nuclei
+    seria escanear ativamente um alvo que nunca foi verificado, violando o
+    motivo de existir da validação de posse. Todo endpoint do Katana passa
+    por aqui antes de qualquer coisa tocar o Nuclei.
+    """
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return False
+    domain = domain.lower()
+    return host == domain or host.endswith(f".{domain}")
+
+
+def run_katana(target_url: str, domain: str) -> Optional[list[str]]:
+    """Retorna None se o Katana não está instalado (distinto de [] = rodou e
+    não achou nada além da própria raiz)."""
+    binary = find_katana_binary()
+    if not binary:
+        return None
+
+    cmd = [binary, "-u", target_url, "-jc", "-d", "3", "-ct", "5", "-silent"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=KATANA_TIMEOUT_SECONDS, shell=False)
+    except subprocess.TimeoutExpired:
+        return []
+    except Exception as exc:
+        print(f"[worker] Katana falhou ao executar, seguindo sem crawl: {exc}")
+        return []
+
+    seen: set[str] = set()
+    endpoints: list[str] = []
+    for line in proc.stdout.splitlines():
+        url = line.strip()
+        if not url or url in seen:
+            continue
+        if not is_in_scope(url, domain):
+            continue
+        seen.add(url)
+        endpoints.append(url)
+        if len(endpoints) >= MAX_KATANA_ENDPOINTS:
+            break
+    return endpoints
+
+
 SEVERITY_DEFAULT_CVSS = {"critical": 9.0, "high": 7.5, "medium": 5.0, "low": 3.0, "info": 0.0}
 
+# Cobre tanto os tags-slug do Nuclei ("xss", "sqli") quanto os nomes de alerta
+# em prosa do ZAP ("Cross Site Scripting (Reflected)", "SQL Injection") — os
+# dois motores alimentam esta mesma função, e testar só contra slugs deixava
+# todo alerta do ZAP cair no bucket genérico (achado real ao rodar o teste
+# deste módulo com um alerta de exemplo do ZAP, não hipótese).
 TAG_TO_OWASP = [
-    (r"sqli|sql-injection", "A03:2021-Injection"),
-    (r"xss", "A03:2021-Injection"),
-    (r"ssrf", "A10:2021-Server-Side Request Forgery (SSRF)"),
-    (r"rce|command-injection", "A03:2021-Injection"),
-    (r"exposure|disclosure|config|misconfig|default-login", "A05:2021-Security Misconfiguration"),
-    (r"auth|login", "A07:2021-Identification and Authentication Failures"),
-    (r"cve", "A06:2021-Vulnerable and Outdated Components"),
+    (r"sqli|sql-injection|sql injection", "A03:2021-Injection"),
+    (r"\bxss\b|cross.?site.?scripting", "A03:2021-Injection"),
+    (r"ssrf|server.?side request forgery", "A10:2021-Server-Side Request Forgery (SSRF)"),
+    (r"rce|command-injection|command injection|remote code execution", "A03:2021-Injection"),
+    (r"exposure|disclosure|config|misconfig|default-login|information leak", "A05:2021-Security Misconfiguration"),
+    (r"auth|login|authentication|session", "A07:2021-Identification and Authentication Failures"),
+    (r"cve|outdated|vulnerable.{0,20}component", "A06:2021-Vulnerable and Outdated Components"),
 ]
 
 
@@ -472,8 +551,14 @@ def nuclei_finding_to_vulnerability(raw: dict) -> dict:
     }
 
 
-def run_nuclei(domain: str, rate_limit: int, waf_bypass: Optional[dict]) -> Optional[list[dict]]:
-    """Retorna None se o Nuclei não está instalado (distinto de [] = rodou e não achou nada)."""
+NUCLEI_TAGS = "cve,misconfig,exposure,sqli,xss,auth,technologies,apache,java"
+
+
+def run_nuclei(domain: str, rate_limit: int, waf_bypass: Optional[dict], endpoints: Optional[list[str]] = None) -> Optional[list[dict]]:
+    """Retorna None se o Nuclei não está instalado (distinto de [] = rodou e não achou nada).
+    `endpoints`, quando não vazio, roda o Nuclei contra a lista descoberta pelo
+    Katana (via -l, um arquivo temporário) em vez de só a URL raiz — mais
+    superfície real coberta, mesmos templates."""
     if not is_safe_hostname(domain):
         return []
     binary = find_nuclei_binary()
@@ -482,7 +567,20 @@ def run_nuclei(domain: str, rate_limit: int, waf_bypass: Optional[dict]) -> Opti
 
     target_url = f"https://{domain}"
     safe_rate = max(1, min(100, int(rate_limit or 15)))
-    cmd = [binary, "-u", target_url, "-severity", "critical,high,medium", "-rate-limit", str(safe_rate), "-jsonl", "-silent", "-timeout", "10", "-irr"]
+    # -tags em vez de -severity: a lista pedida inclui "technologies" (fingerprint,
+    # normalmente severidade info) — um filtro de -severity critical,high,medium
+    # descartaria esses achados antes mesmo de chegarem ao JSON de saída.
+    cmd = [binary, "-tags", NUCLEI_TAGS, "-rate-limit", str(safe_rate), "-jsonl", "-silent", "-timeout", "10", "-irr"]
+
+    endpoints_file: Optional[str] = None
+    if endpoints:
+        fd, endpoints_file = tempfile.mkstemp(prefix="aegis-nuclei-targets-", suffix=".txt")
+        with os.fdopen(fd, "w") as f:
+            f.write("\n".join(endpoints))
+        cmd += ["-l", endpoints_file]
+    else:
+        cmd += ["-u", target_url]
+
     if waf_bypass and waf_bypass.get("enabled") and waf_bypass.get("authHeaderName") and waf_bypass.get("authHeaderValue"):
         cmd += ["-H", f"{waf_bypass['authHeaderName']}: {waf_bypass['authHeaderValue']}"]
 
@@ -490,8 +588,15 @@ def run_nuclei(domain: str, rate_limit: int, waf_bypass: Optional[dict]) -> Opti
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=NUCLEI_TIMEOUT_SECONDS, shell=False)
     except subprocess.TimeoutExpired:
         return []
-    except Exception:
+    except Exception as exc:
+        print(f"[worker] Nuclei falhou ao executar: {exc}")
         return []
+    finally:
+        if endpoints_file:
+            try:
+                os.remove(endpoints_file)
+            except OSError:
+                pass
 
     findings = []
     for line in proc.stdout.splitlines():
@@ -506,7 +611,117 @@ def run_nuclei(domain: str, rate_limit: int, waf_bypass: Optional[dict]) -> Opti
 
 
 # ---------------------------------------------------------------------------
-# Etapa 3: Triagem via Gemini 2.5 Flash (com fallback heurístico honesto)
+# Etapa 2b: OWASP ZAP (opcional — precisa de um daemon local já rodando)
+# ---------------------------------------------------------------------------
+
+ZAP_RISK_TO_SEVERITY = {
+    "high": "HIGH",
+    "medium": "MEDIUM",
+    "low": "LOW",
+    "informational": "INFO",
+}
+
+
+def _poll_zap_progress(get_status, scan_id: str, timeout_seconds: int, label: str) -> None:
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        status = get_status(scanid=scan_id)
+        try:
+            if int(status) >= 100:
+                return
+        except (TypeError, ValueError):
+            return
+        time.sleep(ZAP_POLL_INTERVAL_SECONDS)
+    print(f"[worker] ZAP {label} não terminou em {timeout_seconds}s — seguindo com os alertas já coletados até aqui.")
+
+
+def run_zap(target_url: str) -> Optional[list[dict]]:
+    """Retorna None quando o ZAP está indisponível/inacessível — nunca lança,
+    nunca derruba o job. Só tenta de verdade quando um daemon já está de pé em
+    ZAP_PROXY_URL; este script não sobe nem gerencia o processo do ZAP."""
+    try:
+        from zapv2 import ZAPv2
+    except ImportError:
+        print("[worker] OWASP ZAP not detected or unreachable, continuing with Katana + Nuclei")
+        return None
+
+    try:
+        zap = ZAPv2(apikey=ZAP_API_KEY or None, proxies={"http": ZAP_PROXY_URL, "https": ZAP_PROXY_URL})
+        zap.core.version  # chamada barata só para confirmar que o daemon responde
+
+        spider_scan_id = zap.spider.scan(url=target_url)
+        _poll_zap_progress(zap.spider.status, spider_scan_id, ZAP_SPIDER_TIMEOUT_SECONDS, "spider")
+
+        ascan_scan_id = zap.ascan.scan(url=target_url)
+        _poll_zap_progress(zap.ascan.status, ascan_scan_id, ZAP_ASCAN_TIMEOUT_SECONDS, "active scan")
+
+        alerts = zap.core.alerts(baseurl=target_url)
+        return alerts if isinstance(alerts, list) else []
+    except Exception as exc:
+        print(f"[worker] OWASP ZAP not detected or unreachable, continuing with Katana + Nuclei ({exc})")
+        return None
+
+
+def zap_alert_to_vulnerability(raw: dict) -> dict:
+    # Nomes de campo variam um pouco entre versões da API do ZAP (ex.: "alert"
+    # é o nome oficial do campo de título; "name" aparece como alias em algumas
+    # respostas) — checa as duas grafias em vez de assumir uma só.
+    title = raw.get("alert") or raw.get("name") or "Achado do OWASP ZAP"
+    risk = str(raw.get("risk") or raw.get("severity") or "informational").lower()
+    severity = ZAP_RISK_TO_SEVERITY.get(risk, "INFO")
+    matched_url = raw.get("url") or "N/A"
+    cweid = raw.get("cweid")
+    cwe = f"CWE-{cweid}" if cweid not in (None, "", "-1") else "N/A"
+    reference = raw.get("reference") or ""
+    references = [r for r in reference.split("\n") if r.strip()] if isinstance(reference, str) else []
+
+    return {
+        "id": new_vuln_id("zap"),
+        "title": title,
+        "severity": severity,
+        "cvssScore": SEVERITY_DEFAULT_CVSS.get(severity.lower(), 0.0),
+        "cvssVector": "N/A (não reportado pelo ZAP)",
+        "owaspCategory": guess_owasp_category([raw.get("alertRef", ""), title]),
+        "cwe": cwe,
+        "matchedUrl": matched_url,
+        "toolSource": "OWASP ZAP",
+        "description": raw.get("description") or f"Alerta '{title}' identificado pelo OWASP ZAP em {matched_url}.",
+        "impact": raw.get("evidence") or "Ver descrição do alerta do ZAP para o impacto detalhado.",
+        "status": "CONFIRMED",
+        "aiConfidenceScore": 75,  # ponto de partida; a Etapa 3 (Gemini) recalcula com base na evidência
+        "aiTriageReasoning": "Ainda não triado pela IA — achado bruto do OWASP ZAP antes da Etapa 3.",
+        "dataSource": "REAL_ACTIVE_DAST",
+        "proofOfConcept": {
+            "attackPayload": raw.get("attack") or raw.get("param") or "N/A",
+            "curlCommand": f"curl -i -s -k '{matched_url}'",
+            "httpRequest": f"Ver Histórico do ZAP (messageId {raw.get('messageId', 'N/A')}) para a requisição completa.",
+            "httpResponse": raw.get("evidence") or "Evidência não capturada pelo ZAP para este alerta.",
+            "evidenceText": raw.get("evidence") or f"Alerta '{title}' confirmado pelo OWASP ZAP em {matched_url}.",
+        },
+        "remediation": {
+            "recommendation": raw.get("solution") or "Consulte a documentação do OWASP ZAP para este tipo de alerta.",
+            "references": references,
+        },
+    }
+
+
+def dedupe_vulnerabilities(vulnerabilities: list[dict]) -> list[dict]:
+    """Nuclei e ZAP podem reportar a mesma falha subjacente na mesma URL —
+    mantém a primeira ocorrência (por severidade + URL + título normalizado),
+    descarta duplicatas exatas em vez de inflar a contagem de achados."""
+    seen: set[tuple] = set()
+    unique: list[dict] = []
+    for vuln in vulnerabilities:
+        key = (vuln["severity"], vuln["matchedUrl"], vuln["title"].strip().lower()[:120])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(vuln)
+    return unique
+
+
+# ---------------------------------------------------------------------------
+# Etapa 3: Triagem via Gemini (gemini-3.6-flash) (com fallback heurístico honesto)
 # ---------------------------------------------------------------------------
 
 def triage_with_gemini(vuln: dict, target_domain: str) -> dict:
@@ -538,7 +753,7 @@ Responda ESTRITAMENTE em JSON:
   "recommendedMitigation": string (passo a passo para desenvolvedores)
 }}"""
         response = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3.6-flash",
             contents=prompt,
             config={"response_mime_type": "application/json", "temperature": 0.2},
         )
@@ -578,7 +793,7 @@ def compute_executive_summary(vulnerabilities: list[dict]) -> dict:
         "overallRisk": overall,
         "riskScore": risk_score,
         "businessImpactSummary": (
-            f"A varredura real (recon + Nuclei) identificou {len(confirmed)} achado(s) confirmado(s), "
+            f"A varredura real (recon passivo + Katana/Nuclei/OWASP ZAP, conforme disponíveis) identificou {len(confirmed)} achado(s) confirmado(s), "
             f"incluindo {sum(1 for v in confirmed if v['severity'] == 'CRITICAL')} crítico(s) e "
             f"{sum(1 for v in confirmed if v['severity'] == 'HIGH')} de alto impacto."
             if confirmed else "Nenhuma vulnerabilidade confirmada foi identificada nesta execução real."
@@ -628,31 +843,57 @@ def process_job(redis: Redis, job: dict) -> None:
     })
     append_log(redis, job, "SUCCESS", "Recon", f"Etapa 1 concluída. {len(recon_vulns)} achado(s) real(is).")
 
-    # ---- Etapa 2: Nuclei real ----
+    # ---- Etapa 2: Katana (crawl) -> Nuclei (templates) + OWASP ZAP (spider/active) ----
+    target_url = f"https://{domain}"
     set_status(redis, job, "ACTIVE_SCAN", 1)
-    patch_stage(redis, job, 1, {"status": "RUNNING", "progress": 30, "tool": "Nuclei v3 (execução real via worker local)", "dataSource": "REAL", "summary": "Executando Nuclei real contra o alvo..."})
-    append_log(redis, job, "INFO", "DAST", f"[Nuclei] Executando templates reais (critical,high,medium) com rate-limit {rate_limit} req/s...")
+    patch_stage(redis, job, 1, {"status": "RUNNING", "progress": 25, "tool": "Katana + Nuclei v3 + OWASP ZAP (execução real via worker local)", "dataSource": "REAL", "summary": "Iniciando crawl com Katana..."})
 
-    nuclei_findings = run_nuclei(domain, rate_limit, waf_bypass)
+    endpoints = run_katana(target_url, domain)
+    if endpoints is None:
+        append_log(redis, job, "WARN", "DAST", "[Katana] Binário não encontrado no PATH deste worker (nem em KATANA_PATH). Nuclei vai escanear só a URL raiz.")
+    elif endpoints:
+        append_log(redis, job, "SUCCESS", "DAST", f"[Katana] {len(endpoints)} endpoint(s) real(is) descoberto(s) dentro do escopo de {domain}.")
+    else:
+        append_log(redis, job, "INFO", "DAST", "[Katana] Crawl concluído sem endpoints adicionais dentro do escopo — Nuclei vai escanear a URL raiz.")
+
+    patch_stage(redis, job, 1, {"progress": 45, "summary": "Executando Nuclei real contra o alvo..."})
+    append_log(redis, job, "INFO", "DAST", f"[Nuclei] Executando templates reais (tags: {NUCLEI_TAGS}) com rate-limit {rate_limit} req/s...")
+
+    nuclei_findings = run_nuclei(domain, rate_limit, waf_bypass, endpoints=endpoints or None)
     if nuclei_findings is None:
-        append_log(redis, job, "WARN", "DAST", "[Nuclei] Binário não encontrado no PATH deste worker (nem em NUCLEI_PATH). Etapa 2 rodou vazia — instale o Nuclei para achados reais aqui.")
+        append_log(redis, job, "WARN", "DAST", "[Nuclei] Binário não encontrado no PATH deste worker (nem em NUCLEI_PATH). Nenhum achado de template gerado.")
         nuclei_vulns: list[dict] = []
     else:
         nuclei_vulns = [nuclei_finding_to_vulnerability(f) for f in nuclei_findings]
         append_log(redis, job, "SUCCESS" if nuclei_vulns else "INFO", "DAST", f"[Nuclei] {len(nuclei_vulns)} achado(s) real(is) confirmados pelos templates.")
 
-    job["vulnerabilities"].extend(nuclei_vulns)
-    job["rawFindingsTotal"] += len(nuclei_vulns)
+    patch_stage(redis, job, 1, {"progress": 70, "summary": "Consultando OWASP ZAP local (se disponível)..."})
+    zap_raw_alerts = run_zap(target_url)
+    if zap_raw_alerts is None:
+        append_log(redis, job, "INFO", "DAST", "[OWASP ZAP] Daemon não detectado ou inacessível — seguindo só com Katana + Nuclei.")
+        zap_vulns: list[dict] = []
+    else:
+        zap_vulns = [zap_alert_to_vulnerability(a) for a in zap_raw_alerts]
+        append_log(redis, job, "SUCCESS" if zap_vulns else "INFO", "DAST", f"[OWASP ZAP] {len(zap_vulns)} alerta(s) real(is) recuperado(s) do spider + active scan.")
+
+    stage2_vulns = dedupe_vulnerabilities(nuclei_vulns + zap_vulns)
+    duplicates_removed = (len(nuclei_vulns) + len(zap_vulns)) - len(stage2_vulns)
+    if duplicates_removed > 0:
+        append_log(redis, job, "INFO", "DAST", f"[Dedupe] {duplicates_removed} achado(s) duplicado(s) entre Nuclei e ZAP descartado(s).")
+
+    job["vulnerabilities"].extend(stage2_vulns)
+    job["rawFindingsTotal"] += len(stage2_vulns)
+    engines_ran = [name for name, ok in (("Nuclei", nuclei_findings is not None), ("OWASP ZAP", zap_raw_alerts is not None)) if ok]
     patch_stage(redis, job, 1, {
-        "status": "COMPLETED", "progress": 100, "findingsCount": len(nuclei_vulns), "dataSource": "REAL",
-        "summary": f"{len(nuclei_vulns)} achado(s) real(is) do Nuclei." if nuclei_findings is not None else "Nuclei não instalado neste worker — nenhum achado ativo real gerado.",
+        "status": "COMPLETED", "progress": 100, "findingsCount": len(stage2_vulns), "dataSource": "REAL",
+        "summary": f"{len(stage2_vulns)} achado(s) real(is) via {' + '.join(engines_ran) if engines_ran else 'nenhum motor disponível'}.",
     })
 
     # ---- Etapa 3: Triagem via Gemini ----
     set_status(redis, job, "TRIAGE", 2)
     ai_configured = bool(GEMINI_API_KEY)
-    patch_stage(redis, job, 2, {"status": "RUNNING", "progress": 40, "summary": "Consultando Gemini 2.5 Flash..." if ai_configured else "GEMINI_API_KEY ausente — mantendo classificação bruta."})
-    append_log(redis, job, "INFO", "AI Triage", "[Gemini 2.5 Flash] Iniciando triagem real de cada achado..." if ai_configured else "[Fallback] Nenhuma chave Gemini configurada no worker; achados mantidos como estão.")
+    patch_stage(redis, job, 2, {"status": "RUNNING", "progress": 40, "summary": "Consultando Gemini (gemini-3.6-flash)..." if ai_configured else "GEMINI_API_KEY ausente — mantendo classificação bruta."})
+    append_log(redis, job, "INFO", "AI Triage", "[Gemini (gemini-3.6-flash)] Iniciando triagem real de cada achado..." if ai_configured else "[Fallback] Nenhuma chave Gemini configurada no worker; achados mantidos como estão.")
 
     any_real_model_used = False
     triaged: list[dict] = []
@@ -689,9 +930,12 @@ def process_job(redis: Redis, job: dict) -> None:
 def main() -> None:
     redis = get_redis()
     nuclei_status = find_nuclei_binary() or "NÃO ENCONTRADO (instale e adicione ao PATH, ou configure NUCLEI_PATH em worker/.env)"
+    katana_status = find_katana_binary() or "não encontrado (opcional — Nuclei escaneia só a URL raiz sem ele)"
     print("=" * 70)
     print("[worker] AegisDAST — Worker Local de Varredura Real")
+    print(f"[worker] Katana: {katana_status}")
     print(f"[worker] Nuclei: {nuclei_status}")
+    print(f"[worker] OWASP ZAP: proxy configurado em {ZAP_PROXY_URL} (opcional — testado a cada job, nunca bloqueia a fila se estiver fora do ar)")
     print(f"[worker] Gemini AI Triage: {'configurada' if GEMINI_API_KEY else 'GEMINI_API_KEY ausente — fallback heurístico'}")
     print(f"[worker] Fila: {QUEUE_KEY} (polling a cada {POLL_INTERVAL_SECONDS}s)")
     print("=" * 70)

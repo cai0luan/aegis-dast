@@ -3,3 +3,4 @@ upstash-redis
 google-genai
 dnspython
 python-dotenv
+zaproxy
