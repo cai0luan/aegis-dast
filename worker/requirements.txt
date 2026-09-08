@@ -1,0 +1,5 @@
+requests
+upstash-redis
+google-genai
+dnspython
+python-dotenv

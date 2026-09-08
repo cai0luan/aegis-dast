@@ -98,9 +98,13 @@ export interface Vulnerability {
   aiConfidenceScore: number; // 0 to 100
   aiTriageReasoning: string;
   // REAL_PASSIVE_RECON = observado ao vivo (DNS/HTTP/TLS) contra o alvo verificado.
-  // SIMULATED_DAST = amostra ilustrativa do formato de saída; nenhuma exploração ativa real foi executada
-  // (este ambiente não possui Nuclei/OWASP ZAP/Docker workers reais). Nunca reclassifique sem trocar a fonte de dado real.
-  dataSource: 'REAL_PASSIVE_RECON' | 'SIMULATED_DAST';
+  // REAL_ACTIVE_DAST = achado real do Nuclei, executado de verdade pelo worker Python
+  // local (ver worker/worker.py) — nunca confundir com a amostra simulada abaixo.
+  // SIMULATED_DAST = amostra ilustrativa do formato de saída; usada apenas no caminho
+  // síncrono de fallback (sem Redis configurado, ver server/routes.ts), quando não há
+  // worker real disponível para executar a Etapa 2. Nunca reclassifique sem trocar a
+  // fonte de dado real.
+  dataSource: 'REAL_PASSIVE_RECON' | 'REAL_ACTIVE_DAST' | 'SIMULATED_DAST';
   proofOfConcept: {
     parameter?: string;
     attackPayload: string;

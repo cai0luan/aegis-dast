@@ -295,11 +295,11 @@ export const SecurityReportView: React.FC<SecurityReportViewProps> = ({ scan = S
                         <div className="flex items-center gap-2">
                           <h3 className="font-bold text-base text-white print:text-slate-900">{vuln.title}</h3>
                           <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded border uppercase shrink-0 ${
-                            vuln.dataSource === 'REAL_PASSIVE_RECON'
+                            vuln.dataSource !== 'SIMULATED_DAST'
                               ? 'bg-emerald-950 text-emerald-400 border-emerald-800 print:bg-emerald-50 print:text-emerald-800'
                               : 'bg-amber-950 text-amber-400 border-amber-800 print:bg-amber-50 print:text-amber-800'
                           }`}>
-                            {vuln.dataSource === 'REAL_PASSIVE_RECON' ? 'Real' : 'Simulado'}
+                            {vuln.dataSource === 'REAL_ACTIVE_DAST' ? 'Nuclei Real' : vuln.dataSource === 'REAL_PASSIVE_RECON' ? 'Real' : 'Simulado'}
                           </span>
                         </div>
                         <div className="text-xs text-[#A1A1AA] font-mono mt-1 break-all">{vuln.matchedUrl}</div>

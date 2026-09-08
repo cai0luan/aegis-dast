@@ -195,11 +195,15 @@ export const FalsePositiveAiView: React.FC<FalsePositiveAiViewProps> = ({
                   <span className="text-xs text-[#A1A1AA] font-mono">{selectedVuln.cwe}</span>
                   <span className="text-xs text-[#A1A1AA]">• {selectedVuln.owaspCategory}</span>
                   <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded border uppercase ${
-                    selectedVuln.dataSource === 'REAL_PASSIVE_RECON'
+                    selectedVuln.dataSource !== 'SIMULATED_DAST'
                       ? 'bg-emerald-950 text-emerald-400 border-emerald-800'
                       : 'bg-amber-950 text-amber-400 border-amber-800'
                   }`}>
-                    {selectedVuln.dataSource === 'REAL_PASSIVE_RECON' ? 'Observação Real' : 'Amostra Simulada'}
+                    {selectedVuln.dataSource === 'REAL_ACTIVE_DAST'
+                      ? 'Nuclei Real'
+                      : selectedVuln.dataSource === 'REAL_PASSIVE_RECON'
+                      ? 'Observação Real'
+                      : 'Amostra Simulada'}
                   </span>
                 </div>
                 <h3 className="text-lg font-bold text-white">{selectedVuln.title}</h3>

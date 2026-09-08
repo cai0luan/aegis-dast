@@ -7,8 +7,9 @@ import express, { Request, Response } from 'express';
 import crypto from 'crypto';
 import * as db from './db';
 import { verifyDomainOwnership, sandboxVerify, isSandboxDemoAllowed, generateVerificationToken } from './domainVerification';
-import { startScan, cancelScan } from './scanOrchestrator';
+import { startScan, cancelScan, buildInitialJob } from './scanOrchestrator';
 import { triageVulnerability, isAiConfigured } from './aiTriage';
+import { isRedisConfigured, enqueueScanJob, getScanFromRedis } from './queue';
 import type { TargetDomain, VerificationMethod, ScanProfile, ScanConfiguration } from '../src/types';
 
 export function registerRoutes(app: express.Express) {
@@ -108,12 +109,22 @@ export function registerRoutes(app: express.Express) {
     res.json(result);
   });
 
-  // 4. Scans — síncrono de propósito (ver server/scanOrchestrator.ts): a função
-  // serverless da Vercel é congelada assim que a resposta sai, então um job em
-  // segundo plano com polling entre invocações não é confiável ali (cada poll pode
-  // cair numa instância sem memória nenhuma do job). A rota bloqueia até o pipeline
-  // de 3 etapas terminar e devolve o resultado final direto — mesmo comportamento
-  // em dev local e na Vercel, para não ter um caminho testado e outro não.
+  // 4. Scans — dois caminhos, escolhidos por isRedisConfigured() (ver server/queue.ts):
+  //
+  //   COM Redis (UPSTASH_REDIS_REST_URL/TOKEN configuradas): enfileira o job e
+  //   responde imediatamente com status QUEUED. O worker Python local
+  //   (worker/worker.py) é quem de fato roda o recon real, o Nuclei e a triagem
+  //   por IA, atualizando o hash no Upstash a cada etapa — é ESSE hash que este
+  //   arquivo lê depois. Isto é o que faz o polling do frontend voltar a ser
+  //   seguro em produção: tanto a invocação que recebeu o POST quanto a que
+  //   atende cada GET de polling enxergam o mesmo estado, porque ele mora fora
+  //   das duas (no Upstash), não na memória de nenhuma instância da Vercel.
+  //
+  //   SEM Redis: cai para o pipeline síncrono em processo — a rota bloqueia até
+  //   o scanOrchestrator terminar (recon real + amostra simulada de DAST + IA)
+  //   e devolve o resultado já completo. É o estado suportado para dev local sem
+  //   depender do Upstash nem do worker Python estarem de pé (mesma filosofia de
+  //   "rodar sem X é um estado suportado" usada em toda a camada de persistência).
   app.post('/api/scans', async (req: Request, res: Response) => {
     const { targetId, profile, config } = req.body || {};
     const target = db.getTarget(targetId);
@@ -123,6 +134,11 @@ export function registerRoutes(app: express.Express) {
     }
 
     try {
+      if (isRedisConfigured()) {
+        const job = buildInitialJob(target, (profile as ScanProfile) || 'NORMAL', config as ScanConfiguration);
+        await enqueueScanJob(job);
+        return res.status(202).json({ scan: job });
+      }
       const job = await startScan(target, (profile as ScanProfile) || 'NORMAL', config as ScanConfiguration);
       res.status(200).json({ scan: job });
     } catch (err: any) {
@@ -130,10 +146,34 @@ export function registerRoutes(app: express.Express) {
     }
   });
 
-  app.get('/api/scans/:id', (req: Request, res: Response) => {
-    const job = db.getScan(req.params.id);
-    if (!job) return res.status(404).json({ error: 'Scan não encontrado.' });
-    res.json({ scan: job });
+  app.get('/api/scans/:id', async (req: Request, res: Response) => {
+    try {
+      const job = isRedisConfigured() ? await getScanFromRedis(req.params.id) : db.getScan(req.params.id);
+      if (!job) return res.status(404).json({ error: 'Scan não encontrado.' });
+
+      // O worker Python não tem como enxergar o alvo local (db.ts vive só no
+      // lado Node/Vercel) — então é aqui, ao ler um scan concluído vindo do
+      // Redis, que sincronizamos o score/contagens do alvo. Idempotente: repetir
+      // a mesma escrita em polls seguintes ao já concluído é inofensivo.
+      if (isRedisConfigured() && job.status === 'COMPLETED' && job.executiveSummary) {
+        const confirmed = job.vulnerabilities.filter(v => v.status === 'CONFIRMED');
+        db.updateTarget(job.targetId, {
+          lastScanAt: job.completedAt || new Date().toISOString(),
+          riskScore: job.executiveSummary.riskScore,
+          totalVulns: {
+            critical: confirmed.filter(v => v.severity === 'CRITICAL').length,
+            high: confirmed.filter(v => v.severity === 'HIGH').length,
+            medium: confirmed.filter(v => v.severity === 'MEDIUM').length,
+            low: confirmed.filter(v => v.severity === 'LOW').length,
+            info: confirmed.filter(v => v.severity === 'INFO').length
+          }
+        });
+      }
+
+      res.json({ scan: job });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'Falha ao consultar o scan.' });
+    }
   });
 
   app.get('/api/scans', (req: Request, res: Response) => {

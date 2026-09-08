@@ -11,3 +11,6 @@ coverage/
 *.log
 .env*
 !.env.example
+worker/.venv/
+worker/__pycache__/
+
