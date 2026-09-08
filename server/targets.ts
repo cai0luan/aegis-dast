@@ -11,9 +11,9 @@
 // outro não. Todas as funções são async mesmo quando o backend local é
 // síncrono por baixo, para que o chamador nunca precise saber qual dos dois
 // está ativo.
-import { isRedisConfigured } from './redisClient';
-import * as localDb from './db';
-import * as redisStore from './targetsStore';
+import { isRedisConfigured } from './redisClient.js';
+import * as localDb from './db.js';
+import * as redisStore from './targetsStore.js';
 import type { TargetDomain } from '../src/types';
 
 export async function listTargets(): Promise<TargetDomain[]> {

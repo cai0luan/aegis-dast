@@ -25,7 +25,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import type { TargetDomain, ScanJob } from '../src/types';
-import { INITIAL_TARGETS } from '../src/data/mockSecurityData';
+import { INITIAL_TARGETS } from '../src/data/mockSecurityData.js';
 
 const IS_VERCEL = !!process.env.VERCEL;
 // os.tmpdir() em vez de um literal '/tmp': na Vercel (Linux) resolve para /tmp,

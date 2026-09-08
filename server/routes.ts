@@ -5,12 +5,16 @@
 // porque as duas entradas literalmente compartilham este arquivo.
 import express, { NextFunction, Request, Response } from 'express';
 import crypto from 'crypto';
-import * as db from './db';
-import * as targets from './targets';
-import { verifyDomainOwnership, sandboxVerify, isSandboxDemoAllowed, generateVerificationToken } from './domainVerification';
-import { startScan, cancelScan, buildInitialJob } from './scanOrchestrator';
-import { triageVulnerability, isAiConfigured } from './aiTriage';
-import { isRedisConfigured, enqueueScanJob, getScanFromRedis } from './queue';
+// Extensão .js em todo import relativo deste arquivo: é o entrypoint que a
+// função serverless da Vercel de fato transpila e roda como ESM puro (ver o
+// comentário em api/index.ts). Sem isto, cada um destes vira
+// ERR_MODULE_NOT_FOUND em produção mesmo funcionando localmente via tsx/Vite.
+import * as db from './db.js';
+import * as targets from './targets.js';
+import { verifyDomainOwnership, sandboxVerify, isSandboxDemoAllowed, generateVerificationToken } from './domainVerification.js';
+import { startScan, cancelScan, buildInitialJob } from './scanOrchestrator.js';
+import { triageVulnerability, isAiConfigured } from './aiTriage.js';
+import { isRedisConfigured, enqueueScanJob, getScanFromRedis } from './queue.js';
 import type { TargetDomain, VerificationMethod, ScanProfile, ScanConfiguration } from '../src/types';
 
 // Express 4 não encaminha sozinho a rejeição de uma Promise para o middleware

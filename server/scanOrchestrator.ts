@@ -9,11 +9,11 @@
 // heurístico transparente quando não estiver. Nenhuma etapa promove um dado
 // simulado a "real" — ver Vulnerability.dataSource e ScanStage.dataSource.
 import type { ScanJob, ScanConfiguration, ScanProfile, TargetDomain, Vulnerability, ScanStage } from '../src/types';
-import { createScan, updateScan, getScan } from './db';
-import { updateTarget } from './targets';
-import { runPassiveRecon, deriveVulnerabilitiesFromRecon } from './reconEngine';
-import { triageVulnerability, isAiConfigured } from './aiTriage';
-import { INITIAL_VULNERABILITIES } from '../src/data/mockSecurityData';
+import { createScan, updateScan, getScan } from './db.js';
+import { updateTarget } from './targets.js';
+import { runPassiveRecon, deriveVulnerabilitiesFromRecon } from './reconEngine.js';
+import { triageVulnerability, isAiConfigured } from './aiTriage.js';
+import { INITIAL_VULNERABILITIES } from '../src/data/mockSecurityData.js';
 
 function nowIso() { return new Date().toISOString(); }
 function nowClock() { return new Date().toLocaleTimeString('pt-BR'); }

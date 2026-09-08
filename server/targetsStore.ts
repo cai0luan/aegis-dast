@@ -6,7 +6,7 @@
 //
 //   SADD aegis_targets <id>      -- índice de todos os ids existentes
 //   HSET target:<id> data=<json> -- o TargetDomain inteiro, serializado
-import { getRedisClient } from './redisClient';
+import { getRedisClient } from './redisClient.js';
 import type { TargetDomain } from '../src/types';
 
 const TARGETS_SET_KEY = 'aegis_targets';

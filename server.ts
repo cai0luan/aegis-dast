@@ -5,9 +5,9 @@ import 'dotenv/config';
 import express, { Request, Response } from 'express';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
-import { registerRoutes } from './server/routes';
-import { isAiConfigured } from './server/aiTriage';
-import { isSandboxDemoAllowed } from './server/domainVerification';
+import { registerRoutes } from './server/routes.js';
+import { isAiConfigured } from './server/aiTriage.js';
+import { isSandboxDemoAllowed } from './server/domainVerification.js';
 
 const PORT = Number(process.env.PORT) || 3000;
 

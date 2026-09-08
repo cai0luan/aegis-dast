@@ -11,7 +11,13 @@
 // função enxerga.
 import 'dotenv/config';
 import express from 'express';
-import { registerRoutes } from '../server/routes';
+// Extensão .js obrigatória aqui: a Vercel transpila este arquivo por conta
+// própria (não faz o bundling de módulo único que o esbuild faz para
+// dist/server.cjs), então em runtime isto vira um import ESM puro do Node —
+// e o resolvedor de módulos ESM do Node, ao contrário do require() do CommonJS,
+// não completa extensão sozinho. moduleResolution "bundler" no tsconfig permite
+// escrever ".js" aqui mesmo com o arquivo real sendo server/routes.ts.
+import { registerRoutes } from '../server/routes.js';
 
 const app = express();
 registerRoutes(app);

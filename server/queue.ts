@@ -16,7 +16,7 @@
 // routes.ts cai para o pipeline síncrono em processo (ver scanOrchestrator.ts) —
 // rodar sem fila real é um estado suportado, não um erro, para dev local sem
 // depender de credenciais do Upstash nem do worker Python estar de pé.
-import { getRedisClient, isRedisConfigured } from './redisClient';
+import { getRedisClient, isRedisConfigured } from './redisClient.js';
 import type { ScanJob } from '../src/types';
 
 export { isRedisConfigured };
